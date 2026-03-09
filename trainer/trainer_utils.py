@@ -26,7 +26,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
-from model.model import MiniMindForCausalLM
+from model.model import CookMindForCausalLM
 
 def get_model_params(model, config):
     """
@@ -218,7 +218,7 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
 
     # tokenizer 负责把文本转成 token id，也是数据预处理的重要组成部分。
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = MiniMindForCausalLM(lm_config)
+    model = CookMindForCausalLM(lm_config)
 
     if from_weight!= 'none':
         # 根据当前模型规模和是否使用 MoE，拼出权重文件名。

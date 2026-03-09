@@ -231,7 +231,7 @@ wheels = [
 ]
 
 [[package]]
-name = "minimind"
+name = "cookmind"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

@@ -28,7 +28,7 @@ from contextlib import nullcontext
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from model.model import MiniMindConfig
+from model.model import CookMindConfig
 from dataset.lm_dataset import SFTDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
@@ -116,7 +116,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
 if __name__ == "__main__":
     # ======================== 命令行参数定义 ========================
-    parser = argparse.ArgumentParser(description="MiniMind Full SFT")
+    parser = argparse.ArgumentParser(description="CookMind Full SFT")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='full_sft', type=str, help="保存权重的前缀名")
     # Full SFT 通常只需 2~3 个 epoch，因为更新全部参数，学习效率高。
@@ -142,7 +142,7 @@ if __name__ == "__main__":
     parser.add_argument('--from_weight', default='pretrain', type=str, help="基于哪个权重训练，为none则不基于任何权重训练")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT", help="wandb项目名")
+    parser.add_argument("--wandb_project", type=str, default="CookMind-Full-SFT", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
 
@@ -154,7 +154,7 @@ if __name__ == "__main__":
     
     # ========== 2. 配置目录、模型参数、检查 checkpoint ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+    lm_config = CookMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
@@ -168,7 +168,7 @@ if __name__ == "__main__":
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        wandb_run_name = f"CookMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========

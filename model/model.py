@@ -1,8 +1,8 @@
 """
-MiniMind 模型主体。
+CookMind 模型主体。
 
 这个文件实现的是一个简化版 decoder-only Transformer，核心组件包括：
-1. 配置类 MiniMindConfig
+1. 配置类 CookMindConfig
 2. RMSNorm
 3. RoPE 位置编码
 4. GQA 注意力
@@ -11,9 +11,9 @@ MiniMind 模型主体。
 7. Causal LM 输出头与 loss
 
 阅读建议：
-1. 先看 MiniMindConfig，理解模型有哪些超参数。
+1. 先看 CookMindConfig，理解模型有哪些超参数。
 2. 再看 Attention 和 FeedForward，理解单层 block 的组成。
-3. 最后看 MiniMindModel 和 MiniMindForCausalLM，理解整个前向流程。
+3. 最后看 CookMindModel 和 CookMindForCausalLM，理解整个前向流程。
 """
 
 from typing import Tuple,Optional,List,Union
@@ -26,7 +26,7 @@ from transformers.activations import ACT2FN
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from torch.nn.init import init
 
-class MiniMindConfig(PretrainedConfig):
+class CookMindConfig(PretrainedConfig):
     """
     模型配置类。
 
@@ -34,7 +34,7 @@ class MiniMindConfig(PretrainedConfig):
     后面的每一个模块都会从 config 里读取所需超参数。
     """
 
-    model_type = "minimind"
+    model_type = "cookmind"
 
     def __init__(
         self,
@@ -55,13 +55,22 @@ class MiniMindConfig(PretrainedConfig):
         flash_attention: bool = True,
         
         ############ MoE ############
+        # use_moe=False 时，模型走普通 Dense FFN。
+        # use_moe=True 时，Transformer block 里的 FFN 会被替换成多个专家组成的 MoE FFN。
         use_moe:bool=False,
+        # 每个 token 最多会被分配给多少个专家处理，即 top-k 路由里的 k。
         num_experts_per_tok:int=2,
+        # 路由专家总数。比如 n_routed_experts=4 表示一共有 4 个可选专家。
         n_routed_experts:int=4,
+        # 共享专家数量。共享专家不参与路由，所有 token 都会经过它们。
         n_shared_experts:int=1,
+        # 门控打分函数。当前只实现了 softmax。
         scoring_func:str='softmax',
+        # 辅助损失系数，用来约束门控不要塌缩到少数几个专家。
         aux_loss_alpha:float=0.1,
+        # 是否在“序列级别”统计专家负载均衡辅助损失。
         seq_aux:bool=True,
+        # 是否对 top-k 专家的概率重新归一化，使它们之和为 1。
         norm_topk_prob:bool=True,
         **kwargs,
     ):
@@ -84,6 +93,7 @@ class MiniMindConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.inference_rope_scaling = inference_rope_scaling
         self.flash_attention = flash_attention
+        # 下面这些参数只在启用 MoE 时真正发挥作用。
         self.use_moe=use_moe
         self.num_experts_per_tok=num_experts_per_tok
         self.n_routed_experts=n_routed_experts
@@ -204,10 +214,23 @@ def repeat_kv(x:torch.Tensor,n_rep:int)->torch.Tensor:
         return x[:, :, :, None, :].expand(bs,slen,n_key_value_heads,n_rep,head_dim).reshape(bs,slen,n_key_value_heads*n_rep,head_dim)
 
 class MoEGate(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    """
+    MoE 门控网络。
+
+    它的职责是：
+    1. 对每个 token 的隐藏状态打分，判断更适合交给哪些专家处理。
+    2. 选出 top-k 个专家及其权重。
+    3. 在训练时额外计算一个辅助损失，避免所有 token 都挤到少数几个专家上。
+
+    可以把它理解成一个“调度器”：
+    输入是 token 的表示，输出是“这个 token 该去哪些专家、每个专家占多大权重”。
+    """
+    def __init__(self, config: CookMindConfig):
         super().__init__()
         self.config = config
+        # top_k 即每个 token 会被路由到多少个专家。
         self.top_k = config.num_experts_per_tok
+        # 可路由专家的总数。
         self.n_routed_experts = config.n_routed_experts
 
         self.scoring_func = config.scoring_func
@@ -216,6 +239,8 @@ class MoEGate(nn.Module):
 
         self.norm_topk_prob = config.norm_topk_prob
         self.gating_dim = config.hidden_size
+        # 门控本质上就是一个线性分类器：
+        # hidden_state [hidden_size] -> expert logits [n_routed_experts]
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
         self.reset_parameters()
 
@@ -223,25 +248,46 @@ class MoEGate(nn.Module):
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, hidden_states):
+        # hidden_states: [bsz, seq_len, hidden_size]
         bsz, seq_len, h = hidden_states.shape
+
+        # MoE 的路由是按 token 逐个做的，所以先把 batch 和 seq 展平：
+        # [bsz, seq_len, h] -> [bsz * seq_len, h]
         hidden_states = hidden_states.view(-1, h)
+
+        # 每个 token 对每个专家都打一个原始分数（logits）。
         logits = F.linear(hidden_states, self.weight, None)
         if self.scoring_func == 'softmax':
+            # softmax 后得到每个 token 在所有专家上的概率分布。
             scores = logits.softmax(dim=-1)
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
 
+        # 选出 top-k 个专家：
+        # topk_idx 是专家编号，topk_weight 是对应权重。
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
 
         if self.top_k > 1 and self.norm_topk_prob:
+            # top-k 之后原始概率和通常小于 1，这里重新归一化，
+            # 保证被选中的 k 个专家权重之和等于 1。
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
 
         if self.training and self.alpha > 0.0:
+            # ========== 计算辅助损失（load balancing loss）==========
+            # 目的：防止路由塌缩。
+            # 如果没有辅助损失，模型可能学成“几乎所有 token 都只走某一个专家”，
+            # 这样 MoE 就退化了，其余专家几乎得不到训练。
             scores_for_aux = scores
             aux_topk = self.top_k
+
+            # 把 topk_idx reshape 回 [bsz, seq_len * top_k] 形式，便于统计每个 batch 内
+            # 每个专家到底被分配了多少次。
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
             if self.seq_aux:
+                # 序列级辅助损失：
+                # 对每个 batch 内所有 token 的专家使用情况做统计，
+                # 再与 softmax 概率的平均值做匹配。
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
                 ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
                 ce.scatter_add_(1, topk_idx_for_aux_loss,
@@ -249,57 +295,101 @@ class MoEGate(nn.Module):
                     seq_len * aux_topk / self.n_routed_experts)
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
             else:
+                # 更简单的全局辅助损失：
+                # 用 one-hot 统计被选中频率，再和平均概率做匹配。
                 mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
                 ce = mask_ce.float().mean(0)
                 Pi = scores_for_aux.mean(0)
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
+            # 推理阶段或 alpha=0 时，不需要辅助损失。
             aux_loss = scores.new_zeros(1).squeeze()
+
+        # 返回：
+        # - topk_idx:    每个 token 被分配到哪些专家
+        # - topk_weight: 每个被选专家对应的权重
+        # - aux_loss:    门控的负载均衡辅助损失
         return topk_idx, topk_weight, aux_loss
     
 class MOEFeedForward(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    """
+    MoE 版前馈网络。
+
+    普通 Transformer block 里只有一个 FFN，所有 token 都走同一套参数。
+    这里则改成：
+    - 多个 routed experts（路由专家）
+    - 可选的 shared experts（共享专家）
+
+    对每个 token：
+    1. 门控网络先选出 top-k 个 routed experts。
+    2. 这些 experts 分别处理 token。
+    3. 按门控权重把多个 expert 的输出加权求和。
+    4. 再叠加 shared experts 的输出。
+
+    注意：这里的每个 expert 本质上就是一个独立的 FeedForward(config)。
+    """
+    def __init__(self, config: CookMindConfig):
         super().__init__()
         self.config = config
+        # 路由专家列表：每个专家都是一个独立的 FFN。
         self.experts = nn.ModuleList([
             FeedForward(config)
             for _ in range(config.n_routed_experts)
         ])
         self.gate = MoEGate(config)
         if config.n_shared_experts > 0:
+            # 共享专家不参与门控，所有 token 都会经过它们。
             self.shared_experts = nn.ModuleList([
                 FeedForward(config)
                 for _ in range(config.n_shared_experts)
             ])
 
     def forward(self, x):
+        # identity 用于 shared experts，它们直接吃原始输入而不是路由后的中间结果。
         identity = x
         orig_shape = x.shape
         bsz, seq_len, _ = x.shape
-        # 使用门控机制选择专家
+
+        # 第一步：门控决定每个 token 该去哪些专家。
         topk_idx, topk_weight, aux_loss = self.gate(x)
+
+        # 展平成 token 级处理形式。
         x = x.view(-1, x.shape[-1])
         flat_topk_idx = topk_idx.view(-1)
         if self.training:
+            # 训练态下，为了让每个 token 能被它的 top-k 专家分别处理，
+            # 先把 token 重复 top_k 次。
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+
+            # y 用来收集每个“token-专家分支”的输出。
             y = torch.empty_like(x, dtype=x.dtype)
             for i, expert in enumerate(self.experts):
+                # 取出当前分配给第 i 个专家的所有 token。
                 expert_out = expert(x[flat_topk_idx == i])
                 if expert_out.shape[0] > 0: y[flat_topk_idx == i] = expert_out.to(y.dtype)
                 else: y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(p.sum() for p in expert.parameters())
+
+            # 把 top-k 个专家输出 reshape 回 [num_tokens, top_k, hidden]，
+            # 再按 topk_weight 做加权和，得到每个 token 最终的 routed expert 输出。
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.view(*orig_shape)
         else:
+            # 推理态下用一个更省内存的实现，避免重复展开过多中间张量。
             y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
         if self.config.n_shared_experts > 0:
+            # 共享专家始终参与，输出直接加到 routed experts 的结果上。
             for expert in self.shared_experts:
                 y = y + expert(identity)
+
+        # 保存当前层的门控辅助损失，供上层汇总。
         self.aux_loss = aux_loss
         return y
 
     @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        # 推理态专用实现：
+        # 直接按专家分桶处理 token，再 scatter_add 回原位置，避免训练态那种显式 repeat。
         expert_cache = torch.zeros_like(x)
         idxs = flat_expert_indices.argsort()
         tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
@@ -313,10 +403,16 @@ class MOEFeedForward(nn.Module):
             if start_idx == end_idx:
                 continue
             expert = self.experts[i]
+
+            # 当前专家需要处理的 token 下标。
             exp_token_idx = token_idxs[start_idx:end_idx]
             expert_tokens = x[exp_token_idx]
             expert_out = expert(expert_tokens).to(expert_cache.dtype)
+
+            # 乘上该 token 对当前专家的门控权重。
             expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+
+            # scatter_add 把结果加回到 token 原来的位置。
             expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
 
         return expert_cache
@@ -333,7 +429,7 @@ class Attention(nn.Module):     #GQA
     - 减少 key/value heads，降低显存和计算开销。
     """
 
-    def __init__(self,args:MiniMindConfig):
+    def __init__(self,args:CookMindConfig):
         super().__init__()
 
         # 如果没有单独指定 num_key_value_heads，就退化成普通多头注意力。
@@ -432,7 +528,7 @@ class FeedForward(nn.Module):
     act(gate_proj(x)) * up_proj(x)，然后再经过 down_proj 投回 hidden_size。
     """
 
-    def __init__(self,config:MiniMindConfig):
+    def __init__(self,config:CookMindConfig):
         super().__init__()
         if config.intermediate_size is None:
             # 常见经验做法：中间层维度约为 hidden_size * 8 / 3，
@@ -451,7 +547,7 @@ class FeedForward(nn.Module):
     def forward(self,x):
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
-class MiniMindBlock(nn.Module):
+class CookMindBlock(nn.Module):
     """
     一个完整的 Transformer block。
 
@@ -464,7 +560,7 @@ class MiniMindBlock(nn.Module):
     6. 残差连接
     """
 
-    def __init__(self,layer_id:int,config:MiniMindConfig):
+    def __init__(self,layer_id:int,config:CookMindConfig):
         super().__init__()
         self.num_attention_heads=config.num_attention_heads
         self.hidden_size=config.hidden_size
@@ -491,7 +587,7 @@ class MiniMindBlock(nn.Module):
         hidden_states=hidden_states+self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states,present_key_value
 
-class MiniMindModel(nn.Module):
+class CookMindModel(nn.Module):
     """
     只包含 Transformer 主干，不包含语言模型输出头。
 
@@ -499,7 +595,7 @@ class MiniMindModel(nn.Module):
     如果要真正做文本生成或算语言模型 loss，需要再接一个 lm_head。
     """
 
-    def __init__(self,config:MiniMindConfig):
+    def __init__(self,config:CookMindConfig):
         super().__init__()
         self.config=config
         self.vocab_size=config.vocab_size
@@ -510,7 +606,7 @@ class MiniMindModel(nn.Module):
         self.dropout=nn.Dropout(config.dropout)
 
         # 堆叠多个 Transformer block。
-        self.layers=nn.ModuleList([MiniMindBlock(i,config) for i in range(config.num_hidden_layers)])
+        self.layers=nn.ModuleList([CookMindBlock(i,config) for i in range(config.num_hidden_layers)])
         self.norm=RMSNorm(config.hidden_size,eps=config.rms_norm_eps)
 
         # 预先计算整段上下文范围内 RoPE 所需的 cos/sin 表。
@@ -589,20 +685,20 @@ class MiniMindModel(nn.Module):
         )
         return hidden_states, presents, aux_loss
 
-class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+class CookMindForCausalLM(PreTrainedModel, GenerationMixin):
     """
     完整的因果语言模型。
 
-    它在 MiniMindModel 主干之上再加一个 lm_head，
+    它在 CookMindModel 主干之上再加一个 lm_head，
     用于把 hidden_states 映射回词表大小，得到每个位置的 logits。
     """
 
-    config_class = MiniMindConfig
+    config_class = CookMindConfig
 
-    def __init__(self,config:MiniMindConfig):
-        self.config=config or MiniMindConfig()
+    def __init__(self,config:CookMindConfig):
+        self.config=config or CookMindConfig()
         super().__init__(self.config)
-        self.model=MiniMindModel(self.config)
+        self.model=CookMindModel(self.config)
 
         # lm_head 把 hidden_size 投影到 vocab_size，得到对每个 token 的预测分数。
         self.lm_head=nn.Linear(self.config.hidden_size,self.config.vocab_size,bias=False)

@@ -37,7 +37,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import AutoModel
-from model.model import MiniMindConfig
+from model.model import CookMindConfig
 from dataset.lm_dataset import RLAIFDataset
 from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model
 
@@ -296,7 +296,7 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
 
 if __name__ == "__main__":
     # ======================== 命令行参数定义 ========================
-    parser = argparse.ArgumentParser(description="MiniMind GRPO (Group Relative Policy Optimization)")
+    parser = argparse.ArgumentParser(description="CookMind GRPO (Group Relative Policy Optimization)")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='grpo', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
@@ -329,7 +329,7 @@ if __name__ == "__main__":
     parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward", help="Reward模型路径")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-GRPO", help="wandb项目名")
+    parser.add_argument("--wandb_project", type=str, default="CookMind-GRPO", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
 
@@ -342,7 +342,7 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     # max_seq_len 需要覆盖 prompt + completion 的总长度。
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
+    lm_config = CookMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
                                max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
@@ -357,7 +357,7 @@ if __name__ == "__main__":
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-GRPO-Epoch-{args.epochs}-BS-{args.batch_size}-LR-{args.learning_rate}"
+        wandb_run_name = f"CookMind-GRPO-Epoch-{args.epochs}-BS-{args.batch_size}-LR-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 初始化模型和数据 ==========
